@@ -2,6 +2,7 @@ package com.fieldforcepro.controller;
 
 import com.fieldforcepro.model.AttendanceRecord;
 import com.fieldforcepro.repository.AttendanceRecordRepository;
+import com.fieldforcepro.service.ReverseGeocodingService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.beans.factory.annotation.Value;
@@ -35,13 +36,16 @@ import java.util.UUID;
 public class FieldAttendanceController {
 
     private final AttendanceRecordRepository attendanceRecordRepository;
+    private final ReverseGeocodingService reverseGeocodingService;
     private final Path uploadRoot;
 
     public FieldAttendanceController(
             AttendanceRecordRepository attendanceRecordRepository,
+            ReverseGeocodingService reverseGeocodingService,
             @Value("${fieldforcepro.attendance.upload-dir:attendance-uploads}") String uploadDir
     ) {
         this.attendanceRecordRepository = attendanceRecordRepository;
+        this.reverseGeocodingService = reverseGeocodingService;
         this.uploadRoot = Paths.get(uploadDir).toAbsolutePath().normalize();
         try {
             Files.createDirectories(this.uploadRoot);
@@ -71,13 +75,10 @@ public class FieldAttendanceController {
             String punchInTime,
             String punchOutTime,
             String imageUrl,
-            String reason
-    ) { }
-
-    public record PunchOutRequest(
-            String agentId,
-            String agentName,
-            String reason
+            String punchOutImageUrl,
+            String reason,
+            String address,
+            String punchOutAddress
     ) { }
 
     @PostMapping(path = "/checkin", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -125,6 +126,10 @@ public class FieldAttendanceController {
         record.setWorkType(workType);
         record.setLatitude(latitude);
         record.setLongitude(longitude);
+        if (latitude != null && longitude != null) {
+            String address = reverseGeocodingService.reverseGeocode(latitude, longitude);
+            record.setAddress(address);
+        }
 
         if (image != null && !image.isEmpty()) {
             try {
@@ -208,6 +213,10 @@ public class FieldAttendanceController {
         record.setReason(reason);
         record.setLatitude(latitude);
         record.setLongitude(longitude);
+        if (latitude != null && longitude != null) {
+            String address = reverseGeocodingService.reverseGeocode(latitude, longitude);
+            record.setAddress(address);
+        }
 
         try {
             String ext = "";
@@ -229,11 +238,18 @@ public class FieldAttendanceController {
         return ResponseEntity.ok(dto);
     }
 
-    @PostMapping(path = "/punch-out", consumes = MediaType.APPLICATION_JSON_VALUE)
-    @Operation(summary = "Punch out with auto time (admin)")
+    @PostMapping(path = "/punch-out", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @Operation(summary = "Punch out with auto time and optional image/location (admin or mobile)")
     @Transactional
-    public ResponseEntity<PunchRecordDto> punchOut(@RequestBody PunchOutRequest request) {
-        if (request.agentId() == null || request.agentId().isBlank()) {
+    public ResponseEntity<PunchRecordDto> punchOut(
+            @RequestParam("agentId") String agentId,
+            @RequestParam("agentName") String agentName,
+            @RequestParam(value = "reason", required = false) String reason,
+            @RequestParam(value = "latitude", required = false) Double latitude,
+            @RequestParam(value = "longitude", required = false) Double longitude,
+            @RequestPart(value = "image", required = false) MultipartFile image
+    ) {
+        if (agentId == null || agentId.isBlank()) {
             return ResponseEntity.badRequest().build();
         }
 
@@ -243,25 +259,50 @@ public class FieldAttendanceController {
         Instant toInstant = today.plusDays(1).atStartOfDay(zoneId).toInstant();
 
         List<AttendanceRecord> existingForDay = attendanceRecordRepository
-                .findByAgentIdAndCheckInTimeBetween(request.agentId(), fromInstant, toInstant);
+                .findByAgentIdAndCheckInTimeBetween(agentId, fromInstant, toInstant);
 
         AttendanceRecord record;
         if (!existingForDay.isEmpty()) {
             record = existingForDay.get(0);
         } else {
             record = AttendanceRecord.builder()
-                    .agentId(request.agentId())
-                    .agentName(request.agentName())
+                    .agentId(agentId)
+                    .agentName(agentName)
                     .checkInTime(Instant.now())
                     .status("Present")
-                    .reason(request.reason())
+                    .reason(reason)
                     .build();
         }
 
-        record.setAgentName(request.agentName());
+        record.setAgentName(agentName);
         record.setStatus("Present");
-        record.setReason(request.reason());
+        record.setReason(reason);
         record.setCheckOutTime(Instant.now());
+
+        // Store punch-out specific location and address if provided
+        record.setPunchOutLatitude(latitude);
+        record.setPunchOutLongitude(longitude);
+        if (latitude != null && longitude != null) {
+            String address = reverseGeocodingService.reverseGeocode(latitude, longitude);
+            record.setPunchOutAddress(address);
+        }
+
+        // Store punch-out image if provided
+        if (image != null && !image.isEmpty()) {
+            try {
+                String ext = "";
+                String original = image.getOriginalFilename();
+                if (original != null && original.contains(".")) {
+                    ext = original.substring(original.lastIndexOf('.'));
+                }
+                String filename = UUID.randomUUID() + (ext.isEmpty() ? ".jpg" : ext);
+                Path target = uploadRoot.resolve(filename);
+                Files.copy(image.getInputStream(), target);
+                String url = "/attendance/field/images/file/" + filename;
+                record.setPunchOutImageUrl(url);
+            } catch (Exception ignored) {
+            }
+        }
 
         AttendanceRecord saved = attendanceRecordRepository.save(record);
         PunchRecordDto dto = toPunchDto(saved, zoneId);
@@ -313,7 +354,10 @@ public class FieldAttendanceController {
                 punchIn,
                 punchOut,
                 r.getImageUrl(),
-                r.getReason()
+                r.getPunchOutImageUrl(),
+                r.getReason(),
+                r.getAddress(),
+                r.getPunchOutAddress()
         );
     }
 
@@ -326,7 +370,14 @@ public class FieldAttendanceController {
             String workType,
             Double latitude,
             Double longitude,
-            String imageUrl
+            String imageUrl,
+            String punchInTime,
+            String punchOutTime,
+            String address,
+            Double punchOutLatitude,
+            Double punchOutLongitude,
+            String punchOutImageUrl,
+            String punchOutAddress
     ) { }
 
     @GetMapping("/images")
@@ -347,16 +398,32 @@ public class FieldAttendanceController {
         }
 
         AttendanceRecord r = records.get(0);
+        LocalDateTime inLdt = LocalDateTime.ofInstant(r.getCheckInTime(), zoneId);
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm");
+        String punchIn = fmt.format(inLdt);
+        String punchOut = null;
+        if (r.getCheckOutTime() != null) {
+            LocalDateTime outLdt = LocalDateTime.ofInstant(r.getCheckOutTime(), zoneId);
+            punchOut = fmt.format(outLdt);
+        }
+
         AttendanceImageDto dto = new AttendanceImageDto(
                 r.getId(),
                 r.getAgentId(),
                 r.getAgentName(),
-                LocalDateTime.ofInstant(r.getCheckInTime(), zoneId).toLocalDate(),
+                inLdt.toLocalDate(),
                 r.getStatus(),
                 r.getWorkType(),
                 r.getLatitude(),
                 r.getLongitude(),
-                r.getImageUrl()
+                r.getImageUrl(),
+                punchIn,
+                punchOut,
+                r.getAddress(),
+                r.getPunchOutLatitude(),
+                r.getPunchOutLongitude(),
+                r.getPunchOutImageUrl(),
+                r.getPunchOutAddress()
         );
 
         return ResponseEntity.ok(dto);
@@ -373,20 +440,36 @@ public class FieldAttendanceController {
 
         List<AttendanceRecord> all = attendanceRecordRepository.findAll();
         List<AttendanceImageDto> result = new ArrayList<>();
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("HH:mm");
         for (AttendanceRecord r : all) {
             if (r.getCheckInTime() == null) continue;
             if (r.getCheckInTime().isBefore(fromInstant) || !r.getCheckInTime().isBefore(toInstant)) continue;
+
+            LocalDateTime inLdt = LocalDateTime.ofInstant(r.getCheckInTime(), zoneId);
+            String punchIn = fmt.format(inLdt);
+            String punchOut = null;
+            if (r.getCheckOutTime() != null) {
+                LocalDateTime outLdt = LocalDateTime.ofInstant(r.getCheckOutTime(), zoneId);
+                punchOut = fmt.format(outLdt);
+            }
 
             result.add(new AttendanceImageDto(
                     r.getId(),
                     r.getAgentId(),
                     r.getAgentName(),
-                    LocalDateTime.ofInstant(r.getCheckInTime(), zoneId).toLocalDate(),
+                    inLdt.toLocalDate(),
                     r.getStatus(),
                     r.getWorkType(),
                     r.getLatitude(),
                     r.getLongitude(),
-                    r.getImageUrl()
+                    r.getImageUrl(),
+                    punchIn,
+                    punchOut,
+                    r.getAddress(),
+                    r.getPunchOutLatitude(),
+                    r.getPunchOutLongitude(),
+                    r.getPunchOutImageUrl(),
+                    r.getPunchOutAddress()
             ));
         }
         return result;

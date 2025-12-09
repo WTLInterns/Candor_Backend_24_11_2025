@@ -50,9 +50,25 @@ public class AttendanceRecord {
 
     private Double longitude;
 
+    // Optional human-readable address for the captured location
+    @Column(length = 500)
+    private String address;
+
     // Optional URL or path to an attendance image captured in the field
     @Column(length = 500)
     private String imageUrl;
+
+    // Optional punch-out specific location (kept separate from initial punch-in)
+    private Double punchOutLatitude;
+
+    private Double punchOutLongitude;
+
+    @Column(length = 500)
+    private String punchOutAddress;
+
+    // Optional URL or path to the punch-out image captured in the field
+    @Column(length = 500)
+    private String punchOutImageUrl;
 
     @PrePersist
     public void prePersist() {
